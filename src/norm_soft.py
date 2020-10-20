@@ -4,7 +4,7 @@
 
 Usage:
   norm_soft.py train [--dynet-seed SEED] [--dynet-mem MEM] [--input_format=INPUT_FORMAT]  [--lowercase=LOW]
-    [--input=INPUT] [--hidden=HIDDEN] [--layers=LAYERS] [--vocab_path=VOCAB_PATH] [--conll_format]
+    [--input=INPUT] [--hidden=HIDDEN] [--layers=LAYERS] [--vocab_path=VOCAB_PATH] [--copy] [--conll_format]
     [--dropout=DROPOUT] [--epochs=EPOCHS] [--patience=PATIENCE] [--optimization=OPTIMIZATION]
     MODEL_FOLDER --train_path=TRAIN_FILE --dev_path=DEV_FILE
   norm_soft.py test [--dynet-mem MEM] [--beam=BEAM] [--pred_path=PRED_FILE] [--input_format=INPUT_FORMAT]
@@ -34,9 +34,10 @@ Options:
   --vocab_path=VOCAB_PATH       vocab path, possibly relative to RESULTS_FOLDER [default: vocab.txt]
   --beam=BEAM                   beam width [default: 1]
   --pred_path=PRED_FILE         name for predictions file in the test mode [default: best.test]
-  --input_format=INPUT_FORMAT   coma-separated list of input, output, features columns [default: 0,1,2]
+  --input_format=INPUT_FORMAT   coma-separated list of input, output, features columns [default: 0,2,1]
   --lowercase=LOW               use lowercased data [default: True]
   --conll_format                use conll format
+  --copy                        use copy mechanism
 """
 
 from __future__ import division
@@ -212,7 +213,7 @@ class SoftAttention(object):
         dy.save(best_model_path, [self.fbuffRNN, self.bbuffRNN, self.VOCAB_LOOKUP, self.decoder, self.R, self.bias, self.W_c, self.W__a, self.U__a,  self.v__a])
 
 
-    def bilstm_transduce(self, encoder_frnn, encoder_rrnn, input_char_vecs):
+    def bilstm_transduce(self, encoder_frnn, encoder_rrnn, input_char_vecs, input_chars):
         
         # BiLSTM forward pass
         s_0 = encoder_frnn.initial_state()
@@ -233,7 +234,7 @@ class SoftAttention(object):
         # BiLTSM outputs
         blstm_outputs = []
         for i in xrange(len(input_char_vecs)):
-            blstm_outputs.append(dy.concatenate([frnn_outputs[i], rrnn_outputs[len(input_char_vecs) - i - 1]]))
+            blstm_outputs.append((dy.concatenate([frnn_outputs[i], rrnn_outputs[len(input_char_vecs) - i - 1]]), input_char_vecs[i], input_chars[i]))
         
         return blstm_outputs
 
@@ -265,7 +266,7 @@ class SoftAttention(object):
             char_id = self.char_vocab.w2i.get(char_, self.UNK)
             char_embedding = self.VOCAB_LOOKUP[char_id]
             input_emb.append(char_embedding)
-        biencoder = self.bilstm_transduce(self.fbuffRNN, self.bbuffRNN, input_emb)
+        biencoder = self.bilstm_transduce(self.fbuffRNN, self.bbuffRNN, input_emb, input)
         
         losses = []
         output = []
@@ -279,11 +280,13 @@ class SoftAttention(object):
             # decoder next state
             prev_pred_id = pred_history[-1]
             s = s.add_input(self.VOCAB_LOOKUP[prev_pred_id])
+
+            bilstm_encs, char_embs, chars = zip(*biencoder)
             
             # soft attention vector
-            scores = [v__a * dy.tanh(W__a * s.output() + U__a * h_input) for h_input in biencoder]
+            scores = [v__a * dy.tanh(W__a * s.output() + U__a * h_input) for h_input in bilstm_encs]
             alphas = dy.softmax(dy.concatenate(scores))
-            c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(biencoder)])
+            c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(bilstm_encs)])
             
             # softmax over vocabulary
             h_output = dy.tanh(W_c * dy.concatenate([s.output(), c]))
@@ -345,7 +348,7 @@ class SoftAttention(object):
             char_id = self.char_vocab.w2i.get(char_, self.UNK)
             char_embedding = self.VOCAB_LOOKUP[char_id]
             input_emb.append(char_embedding)
-        self.biencoder = self.bilstm_transduce(self.fbuffRNN, self.bbuffRNN, input_emb)
+        self.biencoder = self.bilstm_transduce(self.fbuffRNN, self.bbuffRNN, input_emb, input)
     
 #        losses = []
 #        output = []
@@ -357,10 +360,11 @@ class SoftAttention(object):
     def predict_next(self):
         (R, bias, W_c, W__a, U__a, v__a) = self.cg_params
 
+        bilstm_encs, char_embs, chars = zip(*self.biencoder)
         # soft attention vector
-        att_scores = [v__a * dy.tanh(W__a * self.s.output() + U__a * h_input) for h_input in self.biencoder]
+        att_scores = [v__a * dy.tanh(W__a * self.s.output() + U__a * h_input) for h_input in bilstm_encs]
         alphas = dy.softmax(dy.concatenate(att_scores))
-        c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(self.biencoder)])
+        c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(bilstm_encs)])
             
         # softmax over vocabulary
         h_output = dy.tanh(W_c * dy.concatenate([self.s.output(), c]))
@@ -377,10 +381,12 @@ class SoftAttention(object):
     def predict_next_(self, state, *args, **kwargs):
         (R, bias, W_c, W__a, U__a, v__a) = self.cg_params
         
+        bilstm_encs, char_embs, chars = zip(*self.biencoder)
+
         # soft attention vector
-        att_scores = [v__a * dy.tanh(W__a * state.output() + U__a * h_input) for h_input in self.biencoder]
+        att_scores = [v__a * dy.tanh(W__a * state.output() + U__a * h_input) for h_input in bilstm_encs]
         alphas = dy.softmax(dy.concatenate(att_scores))
-        c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(self.biencoder)])
+        c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(bilstm_encs)])
         
         # softmax over vocabulary
         h_output = dy.tanh(W_c * dy.concatenate([state.output(), c]))
@@ -589,6 +595,88 @@ class SoftAttention(object):
         results.sort(key=lambda h: h[0])
         return results
 
+
+class SoftCopyAttention(SoftAttention):
+	def __init__(self, *args, **kwargs):
+		super(SoftCopyAttention, self).__init__(*args)
+
+	def build_model(self, pc, best_model_path):
+		if best_model_path:
+			print 'Loading model from: {}'.format(best_model_path)
+			self.fbuffRNN, self.bbuffRNN, self.VOCAB_LOOKUP, self.decoder, self.R, self.bias, self.W_c, self.W__a, self.U__a, self.v__a, self.W_p, self.bias_p = dy.load(best_model_path, pc)
+		else:
+			super(SoftCopyAttention, self).build_model(pc, best_model_path)
+			self.W_p = pc.add_parameters((1, 3 * self.hyperparams['HIDDEN_DIM']))
+			self.bias_p = pc.add_parameters(1)
+
+	def save_model(self, best_model_path):
+		dy.save(best_model_path, [self.fbuffRNN, self.bbuffRNN, self.VOCAB_LOOKUP, self.decoder, self.R, self.bias, self.W_c, self.W__a, self.U__a, self.v__a, self.W_p, self.bias_p])
+
+	def param_init(self, *args):
+		super(SoftCopyAttention, self).param_init(*args)
+		W_p = dy.parameter(self.W_p)
+		bias_p = dy.parameter(self.bias_p)
+		self.cg_params = (self.cg_params, W_p, bias_p)
+
+	def predict_next(self):
+		((R, bias, W_c, W__a, U__a, v__a), W_p, bias_p) = self.cg_params
+
+		bilstm_encs, char_embs, chars = zip(*self.biencoder)
+
+		#soft attention vector
+		att_scores = [v__a * dy.tanh(W__a * self.s.output() + U__a * h_input) for h_input in bilstm_encs]
+		alphas = dy.softmax(dy.concatenate(att_scores))
+		c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(bilstm_encs)])
+		    
+		# softmax over vocabulary
+		h_output = dy.tanh(W_c * dy.concatenate([self.s.output(), c]))
+
+		# generation distribution
+		probs_gen = dy.softmax(R * h_output + bias)
+
+		# mix-in parameter
+		sigmoid_input = dy.concatenate([self.s.output(), c])
+		p = dy.logistic(W_p * sigmoid_input + bias_p)
+
+		# copy distribution
+		probs_copy_np = np.zeros(self.hyperparams['VOCAB_SIZE'])
+		# optimize
+		for i, char in enumerate(chars):
+			probs_copy_np[self.char_vocab.w2i.get(char, self.UNK)] += dy.pick(alphas, i).value()
+		probs_copy = dy.inputTensor(probs_copy_np)
+
+		return dy.cmult(p, probs_gen) + dy.cmult(1 - p, probs_copy)
+
+	def predict_next_(self, state, *args, **kwargs):
+		((R, bias, W_c, W__a, U__a, v__a), W_p, bias_p) = self.cg_params
+
+		bilstm_encs, char_embs, chars = zip(*self.biencoder)
+
+		#soft attention vector
+		att_scores = [v__a * dy.tanh(W__a * state.output() + U__a * h_input) for h_input in bilstm_encs]
+		alphas = dy.softmax(dy.concatenate(att_scores))
+		c = dy.esum([h_input * dy.pick(alphas, j) for j, h_input in enumerate(bilstm_encs)])
+		    
+		# softmax over vocabulary
+		h_output = dy.tanh(W_c * dy.concatenate([state.output(), c]))
+
+		# generation distribution
+		probs_gen = dy.softmax(R * h_output + bias)
+
+		# mix-in parameter
+		sigmoid_input = dy.concatenate([state.output(), c])
+		p = dy.logistic(W_p * sigmoid_input + bias_p)
+
+		# copy distribution
+		probs_copy_np = np.zeros(self.hyperparams['VOCAB_SIZE'])
+		# optimize
+		for i, char in enumerate(chars):
+			probs_copy_np[self.char_vocab.w2i.get(char, self.UNK)] += dy.pick(alphas, i).value()
+		probs_copy = dy.inputTensor(probs_copy_np)
+
+		return dy.cmult(p, probs_gen) + dy.cmult(1 - p, probs_copy)
+
+
 def evaluate_ensemble(nmt_models, data, beam):
     # data is a list of tuples (an instance of SoftDataSet with iter method applied)
     correct = 0.
@@ -737,11 +825,17 @@ def load_ed_models(model_paths, pc):
         model_hyperparams = {'INPUT_DIM': int(hyperparams_dict['INPUT_DIM']),
                             'HIDDEN_DIM': int(hyperparams_dict['HIDDEN_DIM']),
                             'LAYERS': int(hyperparams_dict['LAYERS']),
-                            'VOCAB_PATH': hyperparams_dict['VOCAB_PATH']}
+                            'VOCAB_PATH': hyperparams_dict['VOCAB_PATH'],
+                            'COPY': hyperparams_dict['COPY']=='True'
+                            }
         # a fix for vocab path when transferring files b/n vm
         model_hyperparams['VOCAB_PATH'] = check_path(path + '/vocab.txt', 'vocab_path', is_data_path=False)
         ed_model_params.append(pc.add_subcollection('ed{}'.format(i)))
-        ed_model =  SoftAttention(ed_model_params[i], model_hyperparams,best_model_path)
+
+        if model_hyperparams['COPY']:
+        	ed_model = SoftCopyAttention(ed_model_params[i], model_hyperparams, best_model_path)
+        else:
+        	ed_model =  SoftAttention(ed_model_params[i], model_hyperparams, best_model_path)
         
         ed_models.append(ed_model)
     return ed_models
@@ -808,11 +902,17 @@ if __name__ == "__main__":
                             'HIDDEN_DIM': int(arguments['--hidden']),
                             #'FEAT_INPUT_DIM': int(arguments['--feat-input']),
                             'LAYERS': int(arguments['--layers']),
-                            'VOCAB_PATH': vocab_path}
+                            'VOCAB_PATH': vocab_path,
+                            'COPY': arguments['--copy']
+                            }
     
         print 'Building model...'
         pc = dy.ParameterCollection()
-        ti = SoftAttention(pc, model_hyperparams)
+
+        if arguments['--copy']:
+        	ti = SoftCopyAttention(pc, model_hyperparams)
+        else:
+        	ti = SoftAttention(pc, model_hyperparams)
 
         # Training hypoparameters
         train_hyperparams = {'MAX_PRED_SEQ_LEN': MAX_PRED_SEQ_LEN,
@@ -904,7 +1004,11 @@ if __name__ == "__main__":
                 
         print 'finished training.'
         
-        ti = SoftAttention(pc, model_hyperparams, best_model_path)
+        if arguments['--copy']:
+        	ti = SoftCopyAttention(pc, model_hyperparams, best_model_path)
+        else:
+        	ti = SoftAttention(pc, model_hyperparams, best_model_path)
+
         dev_accuracy, dev_results = ti.evaluate(dev_data.iter(), int(arguments['--beam']))
         print 'Best dev accuracy: {}'.format(dev_accuracy)
         write_param_file(output_file_path, dict(model_hyperparams.items()+train_hyperparams.items()))
@@ -938,11 +1042,17 @@ if __name__ == "__main__":
         model_hyperparams = {'INPUT_DIM': int(hyperparams_dict['INPUT_DIM']),
                             'HIDDEN_DIM': int(hyperparams_dict['HIDDEN_DIM']),
                             'LAYERS': int(hyperparams_dict['LAYERS']),
-                            'VOCAB_PATH': hyperparams_dict['VOCAB_PATH']}
+                            'VOCAB_PATH': hyperparams_dict['VOCAB_PATH'],
+                            'COPY': hyperparams_dict['COPY'] == 'True'	
+                            }
         # a fix for vocab path when transferring files b/n vm
         model_hyperparams['VOCAB_PATH'] = check_path(model_folder + '/vocab.txt', 'vocab_path', is_data_path=False)
         pc = dy.ParameterCollection()
-        ti = SoftAttention(pc, model_hyperparams, best_model_path)
+
+        if model_hyperparams['COPY']:
+        	ti= SoftCopyAttention(pc, model_hyperparams, best_model_path)
+        else:
+        	ti = SoftAttention(pc, model_hyperparams, best_model_path)
 
         print 'Evaluating on test..'
         t = time.clock()
